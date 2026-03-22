@@ -1,0 +1,12 @@
+openai==2.29.0
+soundfile==0.13.1
+silero-vad==6.2.1
+torch==2.10.0
+torchaudio==2.10.0
+numpy==2.1.0
+python-dotenv==1.1.0
+fastapi==0.115.12
+uvicorn==0.34.2
+python-multipart==0.0.20
+pydub==0.25.1
+requests==2.32.3
