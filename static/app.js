@@ -22,9 +22,174 @@ const errorText = document.getElementById('errorText');
 const resetBtn = document.getElementById('resetBtn');
 const errorResetBtn = document.getElementById('errorResetBtn');
 
+// Video elements
+const videoCard = document.getElementById('videoCard');
+const videoLoading = document.getElementById('videoLoading');
+const videoStatus = document.getElementById('videoStatus');
+const videoResult = document.getElementById('videoResult');
+const videoPlayer = document.getElementById('videoPlayer');
+const videoError = document.getElementById('videoError');
+
+// Sidebar elements
+const historyBtn = document.getElementById('historyBtn');
+const sidebar = document.getElementById('sidebar');
+const sidebarOverlay = document.getElementById('sidebarOverlay');
+const sidebarClose = document.getElementById('sidebarClose');
+const sidebarList = document.getElementById('sidebarList');
+const sidebarEmpty = document.getElementById('sidebarEmpty');
+
 let mediaRecorder = null;
 let recordedChunks = [];
 let audioBlob = null;
+let videoPollingTimer = null;
+
+// ── IndexedDB ───────────────────────────────────
+
+const DB_NAME = 'MirrorTalkDB';
+const DB_VERSION = 1;
+const STORE_NAME = 'history';
+
+function openDB() {
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, DB_VERSION);
+        request.onupgradeneeded = (e) => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains(STORE_NAME)) {
+                db.createObjectStore(STORE_NAME, { keyPath: 'id', autoIncrement: true });
+            }
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function saveHistory(record) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        const store = tx.objectStore(STORE_NAME);
+        const req = store.add(record);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+}
+
+async function updateHistory(id, updates) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        const store = tx.objectStore(STORE_NAME);
+        const getReq = store.get(id);
+        getReq.onsuccess = () => {
+            const record = getReq.result;
+            if (record) {
+                Object.assign(record, updates);
+                store.put(record);
+            }
+            resolve();
+        };
+        getReq.onerror = () => reject(getReq.error);
+    });
+}
+
+async function getAllHistory() {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, 'readonly');
+        const store = tx.objectStore(STORE_NAME);
+        const req = store.getAll();
+        req.onsuccess = () => resolve(req.result.reverse());
+        req.onerror = () => reject(req.error);
+    });
+}
+
+// ── Sidebar ─────────────────────────────────────
+
+function openSidebar() {
+    sidebar.classList.add('open');
+    sidebarOverlay.classList.add('open');
+    loadHistoryList();
+}
+
+function closeSidebar() {
+    sidebar.classList.remove('open');
+    sidebarOverlay.classList.remove('open');
+}
+
+historyBtn.addEventListener('click', openSidebar);
+sidebarClose.addEventListener('click', closeSidebar);
+sidebarOverlay.addEventListener('click', closeSidebar);
+
+async function loadHistoryList() {
+    const records = await getAllHistory();
+    // Clear existing cards (keep the empty message element)
+    sidebarList.querySelectorAll('.history-card').forEach(el => el.remove());
+
+    if (records.length === 0) {
+        sidebarEmpty.hidden = false;
+        return;
+    }
+    sidebarEmpty.hidden = true;
+
+    records.forEach(record => {
+        const card = document.createElement('div');
+        card.className = 'history-card';
+        const date = new Date(record.timestamp);
+        const timeStr = date.toLocaleDateString(undefined, {
+            month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+        });
+        card.innerHTML = `
+            <div class="history-card-time">${timeStr}</div>
+            <div class="history-card-text">${escapeHtml(record.transcription || '')}</div>
+            ${record.emotion ? `<span class="history-card-emotion">${escapeHtml(record.emotion)}</span>` : ''}
+        `;
+        card.addEventListener('click', () => showHistoryRecord(record));
+        sidebarList.appendChild(card);
+    });
+}
+
+function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}
+
+function showHistoryRecord(record) {
+    closeSidebar();
+
+    // Show results area with stored data
+    inputArea.hidden = true;
+    loadingArea.hidden = true;
+    errorArea.hidden = true;
+    resultsArea.hidden = false;
+
+    transcriptionText.textContent = record.transcription || '';
+    emotionText.textContent = record.emotion || '';
+    needText.textContent = record.need || '';
+    rewriteText.textContent = record.rewrite || '';
+
+    // Audio URLs (may not be available if server cleaned up)
+    originalAudioPlayer.src = '';
+    outputPlayer.src = record.audioUrl || '';
+
+    // Video
+    if (record.videoUrl) {
+        videoLoading.hidden = true;
+        videoError.hidden = true;
+        videoResult.hidden = false;
+        videoPlayer.src = record.videoUrl;
+        videoCard.hidden = false;
+    } else if (record.imageUrl) {
+        // Video was still processing — show image only
+        videoLoading.hidden = true;
+        videoError.hidden = true;
+        videoResult.hidden = false;
+        videoPlayer.src = '';
+        videoCard.hidden = false;
+    } else {
+        videoCard.hidden = true;
+    }
+}
 
 // ── Recording ────────────────────────────────────
 recordBtn.addEventListener('click', async () => {
@@ -138,6 +303,23 @@ submitBtn.addEventListener('click', async () => {
             loadingArea.hidden = true;
             resultsArea.hidden = false;
         }, 400);
+
+        // Save to history
+        const historyRecord = {
+            timestamp: new Date().toISOString(),
+            transcription: data.transcription || '',
+            emotion: data.emotion || '',
+            need: data.need || '',
+            rewrite: data.rewrite || '',
+            audioUrl: data.audio_url || '',
+            videoUrl: null,
+            imageUrl: null,
+        };
+        const recordId = await saveHistory(historyRecord);
+
+        // Start video generation (non-blocking)
+        startVideoGeneration(data.rewrite, data.emotion, recordId);
+
     } catch (err) {
         clearInterval(stepInterval);
         loadingArea.hidden = true;
@@ -145,6 +327,85 @@ submitBtn.addEventListener('click', async () => {
         errorArea.hidden = false;
     }
 });
+
+// ── Video Generation (non-blocking) ─────────────
+
+async function startVideoGeneration(rewrite, emotion, historyId) {
+    // Reset video card state
+    videoCard.hidden = false;
+    videoLoading.hidden = false;
+    videoResult.hidden = true;
+    videoError.hidden = true;
+    videoStatus.textContent = 'Generating image...';
+
+    try {
+        const resp = await fetch('/api/generate-video', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rewrite, emotion }),
+        });
+
+        if (!resp.ok) {
+            const err = await resp.json();
+            throw new Error(err.detail || 'Video generation failed');
+        }
+
+        const data = await resp.json();
+        const taskId = data.task_id;
+
+        // Update history with image URL
+        if (historyId && data.image_url) {
+            await updateHistory(historyId, { imageUrl: data.image_url });
+        }
+
+        videoStatus.textContent = 'Generating video...';
+        pollVideoStatus(taskId, historyId);
+
+    } catch (err) {
+        videoLoading.hidden = true;
+        videoError.textContent = err.message;
+        videoError.hidden = false;
+    }
+}
+
+function pollVideoStatus(taskId, historyId) {
+    if (videoPollingTimer) clearInterval(videoPollingTimer);
+
+    videoPollingTimer = setInterval(async () => {
+        try {
+            const resp = await fetch(`/api/video-status?taskId=${encodeURIComponent(taskId)}`);
+            if (!resp.ok) throw new Error('Status check failed');
+
+            const data = await resp.json();
+
+            if (data.status === 'completed') {
+                clearInterval(videoPollingTimer);
+                videoPollingTimer = null;
+                videoLoading.hidden = true;
+                videoResult.hidden = false;
+                videoPlayer.src = data.video_url;
+
+                // Update history with video URL
+                if (historyId) {
+                    await updateHistory(historyId, { videoUrl: data.video_url });
+                }
+            } else if (data.status === 'failed') {
+                clearInterval(videoPollingTimer);
+                videoPollingTimer = null;
+                videoLoading.hidden = true;
+                videoError.textContent = data.error || 'Video generation failed';
+                videoError.hidden = false;
+            }
+            // else: still processing, keep polling
+        } catch (err) {
+            clearInterval(videoPollingTimer);
+            videoPollingTimer = null;
+            videoLoading.hidden = true;
+            videoError.textContent = 'Lost connection to video service';
+            videoError.hidden = false;
+        }
+    }, 3000);
+}
 
 // ── Reset ────────────────────────────────────────
 function reset() {
@@ -160,6 +421,17 @@ function reset() {
     loadingArea.hidden = true;
     resultsArea.hidden = true;
     errorArea.hidden = true;
+
+    // Reset video state
+    if (videoPollingTimer) {
+        clearInterval(videoPollingTimer);
+        videoPollingTimer = null;
+    }
+    videoCard.hidden = true;
+    videoLoading.hidden = false;
+    videoResult.hidden = true;
+    videoError.hidden = true;
+    videoPlayer.src = '';
 }
 
 resetBtn.addEventListener('click', reset);

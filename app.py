@@ -4,14 +4,17 @@ Orchestrates M3 v3.5 (emotion analysis + NVC rewrite) and Eigen AI TTS (voice cl
 to transform angry speech into calm, compassionate speech in the speaker's own voice.
 """
 
+import base64
 import os
 import re
 import tempfile
 import uuid
 
+import requests as http_requests
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from pydub import AudioSegment
 
 # NOTE: We re-implement the M3 API call here instead of calling predict() directly
@@ -27,7 +30,11 @@ load_dotenv()
 from openai import OpenAI
 
 OUTPUTS_DIR = "outputs"
+VIDEO_DIR = os.path.join(OUTPUTS_DIR, "video")
 os.makedirs(OUTPUTS_DIR, exist_ok=True)
+os.makedirs(VIDEO_DIR, exist_ok=True)
+
+EIGEN_BASE_URL = "https://api-web.eigenai.com"
 
 NVC_SYSTEM_PROMPT = """You are an emotion decoupling expert. Listen to the user's audio carefully.
 
@@ -195,6 +202,158 @@ async def get_audio(filename: str):
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="Audio not found")
     return FileResponse(path, media_type="audio/wav")
+
+
+# ── Video Generation Pipeline ────────────────────────
+
+
+class VideoRequest(BaseModel):
+    rewrite: str
+    emotion: str
+
+
+def _build_image_prompt(rewrite: str, emotion: str) -> str:
+    """Build a descriptive image prompt from the rewrite and emotion."""
+    return (
+        f"A peaceful, artistic scene that visually represents the emotion of {emotion}. "
+        f"The scene conveys the message: '{rewrite[:120]}'. "
+        "Soft natural lighting, warm colors, cinematic composition, "
+        "high quality, no text, no words, no letters."
+    )
+
+
+def _build_video_prompt(rewrite: str, emotion: str) -> str:
+    """Build a video animation prompt from the rewrite and emotion."""
+    return (
+        f"Gentle, slow cinematic motion. The scene softly comes alive, "
+        f"conveying a feeling of {emotion}. Subtle movement like swaying, "
+        f"floating particles, or gentle light changes. Peaceful and calming."
+    )
+
+
+@app.post("/api/generate-video")
+async def generate_video(req: VideoRequest):
+    """Step 1: Generate image from text, then submit video generation job."""
+    eigen_key = os.environ.get("EIGEN_AI_API_KEY", "")
+    headers = {"Authorization": f"Bearer {eigen_key}"}
+
+    # Step 1: Generate image
+    image_prompt = _build_image_prompt(req.rewrite, req.emotion)
+    try:
+        img_resp = http_requests.post(
+            f"{EIGEN_BASE_URL}/api/v1/generate",
+            headers={**headers, "Content-Type": "application/json"},
+            json={"model": "eigen-image", "prompt": image_prompt},
+            timeout=120,
+        )
+        img_resp.raise_for_status()
+        img_data = img_resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Image generation failed: {e}")
+
+    b64 = img_data.get("turbo_image_base64")
+    if not b64:
+        raise HTTPException(status_code=502, detail="No image returned from API")
+
+    # Save image
+    image_id = uuid.uuid4().hex[:8]
+    image_filename = f"img_{image_id}.png"
+    image_path = os.path.join(VIDEO_DIR, image_filename)
+    with open(image_path, "wb") as f:
+        f.write(base64.b64decode(b64))
+
+    # Step 2: Submit video generation job
+    video_prompt = _build_video_prompt(req.rewrite, req.emotion)
+    try:
+        with open(image_path, "rb") as image_file:
+            vid_resp = http_requests.post(
+                f"{EIGEN_BASE_URL}/api/v1/generate",
+                headers={"Authorization": f"Bearer {eigen_key}"},
+                data={
+                    "model": "wan2p2-i2v-14b-turbo",
+                    "prompt": video_prompt,
+                    "infer_steps": "5",
+                    "seed": "42",
+                },
+                files={"image": (image_filename, image_file, "image/png")},
+                timeout=120,
+            )
+            vid_resp.raise_for_status()
+            vid_data = vid_resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Video job submission failed: {e}")
+
+    task_id = vid_data.get("task_id")
+    if not task_id:
+        raise HTTPException(status_code=502, detail="No task_id returned from video API")
+
+    return JSONResponse({
+        "task_id": task_id,
+        "image_url": f"/video/{image_filename}",
+    })
+
+
+@app.get("/api/video-status")
+async def video_status(taskId: str):
+    """Poll video generation status and download result when complete."""
+    eigen_key = os.environ.get("EIGEN_AI_API_KEY", "")
+    headers = {"Authorization": f"Bearer {eigen_key}"}
+
+    try:
+        status_resp = http_requests.get(
+            f"{EIGEN_BASE_URL}/api/v1/generate/status",
+            params={"jobId": taskId, "model": "wan2p2-i2v-14b-turbo"},
+            headers=headers,
+            timeout=30,
+        )
+        status_resp.raise_for_status()
+        status_data = status_resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Status check failed: {e}")
+
+    status = status_data.get("status")
+
+    if status == "completed":
+        # Download the video
+        try:
+            video_resp = http_requests.get(
+                f"{EIGEN_BASE_URL}/api/v1/generate/result",
+                params={"jobId": taskId, "model": "wan2p2-i2v-14b-turbo"},
+                headers=headers,
+                timeout=120,
+            )
+            video_resp.raise_for_status()
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Video download failed: {e}")
+
+        video_filename = f"vid_{uuid.uuid4().hex[:8]}.mp4"
+        video_path = os.path.join(VIDEO_DIR, video_filename)
+        with open(video_path, "wb") as f:
+            f.write(video_resp.content)
+
+        return JSONResponse({
+            "status": "completed",
+            "video_url": f"/video/{video_filename}",
+        })
+    elif status == "failed":
+        return JSONResponse({
+            "status": "failed",
+            "error": status_data.get("error", "Unknown error"),
+        })
+    else:
+        return JSONResponse({"status": "processing"})
+
+
+@app.get("/video/{filename}")
+async def get_video(filename: str):
+    """Serve generated images and videos."""
+    if not re.match(r"^[a-zA-Z0-9_\-]+\.(mp4|png)$", filename):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    path = os.path.join(VIDEO_DIR, filename)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="File not found")
+    media_type = "video/mp4" if filename.endswith(".mp4") else "image/png"
+    return FileResponse(path, media_type=media_type)
 
 
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
